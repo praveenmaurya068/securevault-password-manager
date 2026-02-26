@@ -1,0 +1,548 @@
+// ═══════════════════════════════════════════════════════════════
+//  SecureVault – Password Manager · Code.gs
+//  Updated: Full sheet migration, validation & all CRUD ops
+// ═══════════════════════════════════════════════════════════════
+
+// ── Web App Entry ────────────────────────────────────────────────
+function doGet() {
+  return HtmlService.createHtmlOutputFromFile('index2')
+    .setTitle("SecureVault – Password Manager")
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  COLUMN MAP  (0-indexed, matches sheet columns A→G)
+// ═══════════════════════════════════════════════════════════════
+//  A(0) Site | B(1) Username | C(2) Encrypted Password
+//  D(3) Notes | E(4) Category | F(5) Date Added | G(6) Last Updated
+
+var COL = {
+  SITE:    0,
+  USER:    1,
+  PASS:    2,
+  NOTES:   3,
+  CAT:     4,
+  DATE:    5,
+  UPDATED: 6
+};
+
+// Expected headers in order
+var HEADERS = [
+  "Site",
+  "Username",
+  "Encrypted Password",
+  "Notes",
+  "Category",
+  "Date Added",
+  "Last Updated"
+];
+
+// Column widths in pixels
+var COL_WIDTHS = [160, 180, 260, 200, 110, 150, 150];
+
+// ═══════════════════════════════════════════════════════════════
+//  SHEET MANAGEMENT
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Returns the PASSWORD_DB sheet.
+ * Creates it fresh if missing, or migrates it if outdated.
+ * This is the single entry point for all sheet access.
+ */
+function getSheet_() {
+  var ss    = SpreadsheetApp.getActive();
+  var sheet = ss.getSheetByName("PASSWORD_DB");
+
+  if (!sheet) {
+    sheet = createFreshSheet_(ss);
+  } else {
+    migrateSheet_(sheet);   // safe no-op when schema is already correct
+  }
+
+  return sheet;
+}
+
+// ── Create brand-new sheet with full formatting ──────────────────
+function createFreshSheet_(ss) {
+  var sheet = ss.insertSheet("PASSWORD_DB");
+
+  // Write headers
+  sheet.getRange(1, 1, 1, HEADERS.length).setValues([HEADERS]);
+
+  // Freeze header row
+  sheet.setFrozenRows(1);
+
+  // Set column widths
+  for (var i = 0; i < HEADERS.length; i++) {
+    sheet.setColumnWidth(i + 1, COL_WIDTHS[i]);
+  }
+
+  // Style header
+  styleHeaderRow_(sheet);
+
+  // Tab color
+  sheet.setTabColor("#c9a84c");
+
+  // Protect header from accidental edits (warning only)
+  protectHeader_(sheet);
+
+  Logger.log("SecureVault: PASSWORD_DB created fresh.");
+  return sheet;
+}
+
+/**
+ * Checks if any expected columns are missing from the existing sheet
+ * and adds them one by one, back-filling sensible defaults in data rows.
+ * Safe to call multiple times — does nothing if schema is already current.
+ */
+function migrateSheet_(sheet) {
+  // Read current headers (only as many columns as exist)
+  var lastCol        = sheet.getLastColumn();
+  var existingRow    = lastCol > 0
+      ? sheet.getRange(1, 1, 1, lastCol).getValues()[0]
+      : [];
+  var existingHeaders = existingRow.map(function(h) { return String(h).trim(); });
+
+  var changed = false;
+
+  for (var idx = 0; idx < HEADERS.length; idx++) {
+    var expectedHeader = HEADERS[idx];
+    var colNum         = idx + 1; // 1-indexed
+
+    if (existingHeaders[idx] !== expectedHeader) {
+      // --- Column is missing at this position ---
+
+      var currentLastCol = sheet.getLastColumn();
+
+      if (colNum > currentLastCol) {
+        // Append: the column simply doesn't exist yet
+        sheet.insertColumnAfter(currentLastCol);
+      } else {
+        // Insert before an existing column to keep order
+        sheet.insertColumnBefore(colNum);
+      }
+
+      // Write the header label
+      sheet.getRange(1, colNum).setValue(expectedHeader);
+
+      // Back-fill existing data rows with a default value
+      backfillColumn_(sheet, colNum, expectedHeader);
+
+      // Set column width
+      sheet.setColumnWidth(colNum, COL_WIDTHS[idx] || 140);
+
+      // Keep the local tracking array in sync so subsequent
+      // iterations see the correct column positions
+      existingHeaders.splice(idx, 0, expectedHeader);
+
+      changed = true;
+      Logger.log("SecureVault migration: added column '" + expectedHeader + "' at col " + colNum);
+    }
+  }
+
+  if (changed) {
+    styleHeaderRow_(sheet);
+    sheet.setTabColor("#c9a84c");
+    Logger.log("SecureVault migration: complete.");
+  }
+}
+
+/**
+ * Back-fills a newly-added column with sensible defaults
+ * so existing rows aren't left with empty critical fields.
+ */
+function backfillColumn_(sheet, colNum, headerName) {
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return; // no data rows yet
+
+  var dataRows = lastRow - 1;
+  var range    = sheet.getRange(2, colNum, dataRows, 1);
+
+  switch (headerName) {
+    case "Category":
+      range.setValue("General");
+      break;
+    case "Date Added":
+    case "Last Updated":
+      range.setValue(new Date());
+      break;
+    default:
+      range.setValue("");
+  }
+}
+
+/**
+ * Applies the SecureVault dark-gold style to the header row.
+ */
+function styleHeaderRow_(sheet) {
+  var totalCols = sheet.getLastColumn();
+  if (totalCols < 1) return;
+
+  sheet.getRange(1, 1, 1, totalCols)
+    .setBackground("#0d0f14")
+    .setFontColor("#c9a84c")
+    .setFontWeight("bold")
+    .setFontFamily("Arial")
+    .setFontSize(10)
+    .setHorizontalAlignment("left")
+    .setVerticalAlignment("middle");
+
+  sheet.setRowHeight(1, 36);
+}
+
+/**
+ * Adds a warning-only protection to row 1
+ * so editors see an alert before changing headers.
+ */
+function protectHeader_(sheet) {
+  try {
+    var prot = sheet.getRange("1:1").protect();
+    prot.setDescription("SecureVault Header – Do Not Edit");
+    prot.setWarningOnly(true);
+  } catch (e) {
+    Logger.log("Header protection skipped: " + e.message);
+  }
+}
+
+// ── Applies alternating row shading to a single data row ─────────
+function formatDataRow_(sheet, rowNum) {
+  var bg = (rowNum % 2 === 0) ? "#111520" : "#0f1219";
+  sheet.getRange(rowNum, 1, 1, HEADERS.length)
+    .setBackground(bg)
+    .setFontColor("#e4e6f0")
+    .setFontSize(10)
+    .setVerticalAlignment("middle");
+  sheet.setRowHeight(rowNum, 28);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  PUBLIC ADMIN FUNCTIONS  (run from Apps Script editor)
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * ► Run this from Apps Script Editor → Run → runMigration
+ *   to migrate an old 5-column sheet to the new 7-column schema.
+ */
+function runMigration() {
+  var ss    = SpreadsheetApp.getActive();
+  var sheet = ss.getSheetByName("PASSWORD_DB");
+
+  if (!sheet) {
+    SpreadsheetApp.getUi().alert(
+      "No PASSWORD_DB sheet found.\n\nOpen the web app first to create it automatically."
+    );
+    return;
+  }
+
+  migrateSheet_(sheet);
+
+  // Reformat all existing data rows
+  var lastRow = sheet.getLastRow();
+  for (var r = 2; r <= lastRow; r++) {
+    formatDataRow_(sheet, r);
+  }
+
+  SpreadsheetApp.getUi().alert("✅ Migration complete! Your sheet is now up to date.");
+}
+
+/**
+ * ► Run debugSheetInfo from the editor to inspect sheet health.
+ */
+function debugSheetInfo() {
+  var ss    = SpreadsheetApp.getActive();
+  var sheet = ss.getSheetByName("PASSWORD_DB");
+
+  if (!sheet) {
+    Logger.log("❌ No PASSWORD_DB sheet found.");
+    return;
+  }
+
+  var lastCol  = sheet.getLastColumn();
+  var headers  = lastCol > 0
+      ? sheet.getRange(1, 1, 1, lastCol).getValues()[0]
+      : [];
+  var lastRow  = sheet.getLastRow();
+
+  Logger.log("=== SecureVault Sheet Debug ===");
+  Logger.log("Sheet:     " + sheet.getName());
+  Logger.log("Rows:      " + lastRow + " (" + Math.max(0, lastRow - 1) + " entries)");
+  Logger.log("Columns:   " + lastCol);
+  Logger.log("Current:   " + JSON.stringify(headers));
+  Logger.log("Expected:  " + JSON.stringify(HEADERS));
+
+  var ok = true;
+  for (var i = 0; i < HEADERS.length; i++) {
+    if (String(headers[i] || "").trim() !== HEADERS[i]) {
+      Logger.log("⚠️  Column " + (i+1) + " mismatch — expected '" + HEADERS[i] + "', found '" + headers[i] + "'");
+      ok = false;
+    }
+  }
+
+  Logger.log(ok ? "✅ Schema is up to date." : "→  Run runMigration() to fix mismatches.");
+}
+
+/**
+ * ► DEV ONLY: Completely wipes and recreates the sheet.
+ *   Shows a confirmation dialog before deleting data.
+ */
+function resetSheet_DEV_ONLY() {
+  var ss   = SpreadsheetApp.getActive();
+  var ui   = SpreadsheetApp.getUi();
+  var resp = ui.alert(
+    "⚠️ DANGER",
+    "This will DELETE ALL PASSWORDS permanently.\n\nAre you sure?",
+    ui.ButtonSet.YES_NO
+  );
+
+  if (resp !== ui.Button.YES) {
+    ui.alert("Reset cancelled. No data was deleted.");
+    return;
+  }
+
+  var old = ss.getSheetByName("PASSWORD_DB");
+  if (old) ss.deleteSheet(old);
+
+  createFreshSheet_(ss);
+  ui.alert("✅ Sheet reset. All data has been deleted and the sheet recreated.");
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  CRUD OPERATIONS
+// ═══════════════════════════════════════════════════════════════
+
+// ── Save Password ─────────────────────────────────────────────────
+function savePassword(site, username, password, key, notes, category) {
+  if (!site)     throw new Error("Website name is required.");
+  if (!username) throw new Error("Username / email is required.");
+  if (!password) throw new Error("Password is required.");
+  if (!key)      throw new Error("Master key is required.");
+  validateKey_(key);
+
+  var sheet = getSheet_();
+  var data  = sheet.getDataRange().getValues();
+
+  // Block duplicate entries for the same site
+  for (var i = 1; i < data.length; i++) {
+    if (normalize_(data[i][COL.SITE]) === normalize_(site)) {
+      throw new Error("An entry for '" + site.trim() + "' already exists. Use Edit to update it.");
+    }
+  }
+
+  var encrypted = encrypt_(password, key);
+  var now       = new Date();
+
+  sheet.appendRow([
+    site.trim(),
+    username.trim(),
+    encrypted,
+    (notes    || "").trim(),
+    (category || "General"),
+    now,
+    now
+  ]);
+
+  // Format the new row
+  formatDataRow_(sheet, sheet.getLastRow());
+
+  return "Password saved for " + site.trim() + "!";
+}
+
+// ── Get Password ──────────────────────────────────────────────────
+function getPassword(site, key) {
+  if (!site) throw new Error("Website name is required.");
+  if (!key)  throw new Error("Master key is required.");
+
+  var sheet = getSheet_();
+  var data  = sheet.getDataRange().getValues();
+
+  for (var i = 1; i < data.length; i++) {
+    if (normalize_(data[i][COL.SITE]) === normalize_(site)) {
+      return decrypt_(data[i][COL.PASS], key);
+    }
+  }
+  return "Not Found";
+}
+
+// ── Get Site List (for dropdown) ──────────────────────────────────
+function getSiteList() {
+  var sheet = getSheet_();
+  var data  = sheet.getDataRange().getValues();
+  var seen  = {};
+  var sites = [];
+
+  for (var i = 1; i < data.length; i++) {
+    var s = String(data[i][COL.SITE] || "").trim();
+    if (s && !seen[s.toLowerCase()]) {
+      sites.push(s);
+      seen[s.toLowerCase()] = true;
+    }
+  }
+
+  return sites.sort(function(a, b) {
+    return a.toLowerCase().localeCompare(b.toLowerCase());
+  });
+}
+
+// ── Get All Entries (no passwords) ────────────────────────────────
+function getAllEntries() {
+  var sheet   = getSheet_();
+  var data    = sheet.getDataRange().getValues();
+  var entries = [];
+
+  for (var i = 1; i < data.length; i++) {
+    var row  = data[i];
+    var site = String(row[COL.SITE] || "").trim();
+    if (!site) continue;
+
+    var dateStr    = "";
+    var updatedStr = "";
+
+    try {
+      if (row[COL.DATE]    && row[COL.DATE]    !== "") dateStr    = new Date(row[COL.DATE]).toISOString();
+      if (row[COL.UPDATED] && row[COL.UPDATED] !== "") updatedStr = new Date(row[COL.UPDATED]).toISOString();
+    } catch (e) { /* leave empty on parse failure */ }
+
+    entries.push({
+      site:     site,
+      username: String(row[COL.USER]  || "").trim(),
+      notes:    String(row[COL.NOTES] || "").trim(),
+      category: String(row[COL.CAT]   || "General").trim(),
+      date:     dateStr,
+      updated:  updatedStr
+    });
+  }
+
+  entries.sort(function(a, b) {
+    return a.site.toLowerCase().localeCompare(b.site.toLowerCase());
+  });
+
+  return entries;
+}
+
+// ── Update Password ───────────────────────────────────────────────
+function updatePassword(site, newPassword, key, notes, category) {
+  if (!site)        throw new Error("Website name is required.");
+  if (!newPassword) throw new Error("New password is required.");
+  if (!key)         throw new Error("Master key is required.");
+  validateKey_(key);
+
+  var sheet = getSheet_();
+  var data  = sheet.getDataRange().getValues();
+
+  for (var i = 1; i < data.length; i++) {
+    if (normalize_(data[i][COL.SITE]) === normalize_(site)) {
+
+      // Verify master key before allowing update
+      var existing = decrypt_(data[i][COL.PASS], key);
+      if (existing === "Wrong Master Key") {
+        throw new Error("Wrong Master Key — update rejected.");
+      }
+
+      var rowNum    = i + 1;
+      var encrypted = encrypt_(newPassword, key);
+
+      // Batch update: Encrypted Pwd, Notes, Category, Date Added (preserve), Last Updated
+      sheet.getRange(rowNum, COL.PASS + 1, 1, 5).setValues([[
+        encrypted,
+        (notes    !== undefined && notes    !== null) ? String(notes).trim()    : String(data[i][COL.NOTES] || ""),
+        (category !== undefined && category !== null) ? String(category).trim() : String(data[i][COL.CAT]   || "General"),
+        data[i][COL.DATE],  // preserve original Date Added
+        new Date()           // update Last Updated timestamp
+      ]]);
+
+      return "Password updated for " + site + "!";
+    }
+  }
+
+  throw new Error("No entry found for: " + site);
+}
+
+// ── Delete Entry ──────────────────────────────────────────────────
+function deleteEntry(site, key) {
+  if (!site) throw new Error("Website name is required.");
+  if (!key)  throw new Error("Master key is required.");
+  validateKey_(key);
+
+  var sheet = getSheet_();
+  var data  = sheet.getDataRange().getValues();
+
+  for (var i = 1; i < data.length; i++) {
+    if (normalize_(data[i][COL.SITE]) === normalize_(site)) {
+
+      // Verify master key before deleting
+      var check = decrypt_(data[i][COL.PASS], key);
+      if (check === "Wrong Master Key") {
+        throw new Error("Wrong Master Key — delete rejected.");
+      }
+
+      sheet.deleteRow(i + 1);
+      return "Entry deleted for " + site + ".";
+    }
+  }
+
+  throw new Error("No entry found for: " + site);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  CRYPTO  (SHA-256 fingerprint + Base64)
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Encrypts by appending a SHA-256 hash of the key.
+ * Raw master key is NEVER written to the spreadsheet.
+ */
+function encrypt_(text, key) {
+  var combined = text + "::" + hashKey_(key);
+  return Utilities.base64Encode(combined, Utilities.Charset.UTF_8);
+}
+
+/**
+ * Decodes and verifies the stored key hash.
+ * Returns "Wrong Master Key" string on mismatch — not an exception.
+ */
+function decrypt_(encoded, key) {
+  try {
+    var decoded = Utilities.newBlob(
+      Utilities.base64Decode(encoded)
+    ).getDataAsString();
+
+    var sep = decoded.lastIndexOf("::");
+    if (sep === -1) return "Wrong Master Key";
+
+    var storedHash = decoded.substring(sep + 2);
+    var password   = decoded.substring(0, sep);
+
+    if (storedHash !== hashKey_(key)) return "Wrong Master Key";
+    return password;
+  } catch (e) {
+    Logger.log("Decrypt error: " + e.message);
+    return "Wrong Master Key";
+  }
+}
+
+/**
+ * SHA-256 fingerprint of the master key (22-char Base64 slice).
+ */
+function hashKey_(key) {
+  var bytes = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_256,
+    key,
+    Utilities.Charset.UTF_8
+  );
+  return Utilities.base64Encode(bytes).substring(0, 22);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  VALIDATION
+// ═══════════════════════════════════════════════════════════════
+
+function validateKey_(key) {
+  if (!key || String(key).trim().length < 4) {
+    throw new Error("Master key must be at least 4 characters long.");
+  }
+}
+
+function normalize_(str) {
+  return String(str || "").trim().toLowerCase();
+}
